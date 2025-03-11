@@ -18,78 +18,102 @@ Contributor: eibarolle
 """
 
 from __future__ import annotations
-
-import warnings
-from typing import Optional
-
+from typing import Type, Any
 import torch
-from botorch import settings
+from botorch.acquisition import AcquisitionFunction
 from botorch_community.models.np_regression import NeuralProcessModel
 from torch import Tensor
+# reference: https://arxiv.org/abs/2106.02770
 
-import torch
-#reference: https://arxiv.org/abs/2106.02770 
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-class LatentInformationGain:
+
+class LatentInformationGain(AcquisitionFunction):
     def __init__(
-        self, 
-        model: NeuralProcessModel, 
+        self,
+        model: Type[Any] = NeuralProcessModel,
         num_samples: int = 10,
-        min_std: float = 0.1,
-        scaler: float = 0.9
+        min_std: float = 0.01,
+        scaler: float = 0.5,
     ) -> None:
         """
-        Latent Information Gain (LIG) Acquisition Function, designed for the
-        NeuralProcessModel.
+        Latent Information Gain (LIG) Acquisition Function.
+        Uses the model's built-in posterior function to generalize KL computation.
 
         Args:
-            model: Trained NeuralProcessModel.
+            model: The model class to be used, defaults to NeuralProcessModel.
             num_samples (int): Number of samples for calculation, defaults to 10.
-            min_std: Float representing the minimum possible standardized std, defaults to 0.1.
-            scaler: Float scaling the std, defaults to 0.9.
+            min_std: Float representing the minimum possible standardized std,
+                defaults to 0.01.
+            scaler: Float scaling the std, defaults to 0.5.
         """
+        super().__init__(model)
         self.model = model
         self.num_samples = num_samples
         self.min_std = min_std
         self.scaler = scaler
 
-    def acquisition(self, candidate_x, context_x, context_y):
+    def forward(self, candidate_x: Tensor) -> Tensor:
         """
-        Conduct the Latent Information Gain acquisition function for the inputs.
+        Conduct the Latent Information Gain acquisition function using the model's
+            posterior.
 
         Args:
-            candidate_x: Candidate input points, as a Tensor.
-            context_x: Context input points, as a Tensor.
-            context_y: Context target points, as a Tensor.
+            candidate_x: Candidate input points, as a Tensor. Ideally in the shape
+                (N, q, D).
 
         Returns:
-            torch.Tensor: The LIG score of computed KLDs.
+            torch.Tensor: The LIG scores of computed KLDs, in the shape (N, q).
         """
+        candidate_x = candidate_x.to(device)
+        if candidate_x.dim() == 2:
+            candidate_x = candidate_x.unsqueeze(0)  # Ensure (N, q, D) format
+        N, q, D = candidate_x.shape
 
-        # Encoding and Scaling the context data
-        z_mu_context, z_logvar_context = self.model.data_to_z_params(context_x, context_y)
-        kl = 0.0
-        for _ in range(self.num_samples):
-            # Taking reparameterized samples
-            samples = self.model.sample_z(z_mu_context, z_logvar_context)
+        kl = torch.zeros(N, q, device=device)
 
-            # Using the Decoder to take predicted values
-            y_pred = self.model.decoder(candidate_x, samples)
+        if isinstance(self.model, NeuralProcessModel):
+            x_c, y_c, x_t, y_t = self.model.random_split_context_target(
+                self.model.train_X[:, 0], self.model.train_Y
+            )
+            print(x_c.shape)
+            print(y_c.shape)
+            print(self.model.train_X)
+            print(self.model.train_X[:, 0])
+            print(self.model.train_Y)
+            print(self.model.train_Y[:, 0])
+            z_mu_context, z_logvar_context = self.model.data_to_z_params(x_c, y_c, xy_dim = -1)
+            print(z_mu_context)
+            print(z_logvar_context)
+            for _ in range(self.num_samples):
+                # Taking Samples/Predictions
+                samples = self.model.sample_z(z_mu_context, z_logvar_context)
+                y_pred = self.model.decoder(candidate_x.view(-1, D), samples)
+                # Combining the data
+                combined_x = torch.cat(
+                    [x_c, candidate_x.view(-1, D)], dim=0
+                ).to(device)
+                combined_y = torch.cat([self.y_c, y_pred], dim=0).to(device)
+                # Computing posterior variables
+                z_mu_posterior, z_logvar_posterior = self.model.data_to_z_params(
+                    combined_x, combined_y
+                )
+                std_prior = self.min_std + self.scaler * torch.sigmoid(z_logvar_context)
+                std_posterior = self.min_std + self.scaler * torch.sigmoid(
+                    z_logvar_posterior
+                )
+                p = torch.distributions.Normal(z_mu_posterior, std_posterior)
+                q = torch.distributions.Normal(z_mu_context, std_prior)
+                kl_divergence = torch.distributions.kl_divergence(p, q).sum(dim=-1)
+                kl += kl_divergence
+        else:
+            for _ in range(self.num_samples):
+                posterior_prior = self.model.posterior(self.model.train_X)
+                posterior_candidate = self.model.posterior(candidate_x.view(-1, D))
 
-            # Combining context and candidate data
-            combined_x = torch.cat([context_x, candidate_x], dim=0)
-            combined_y = torch.cat([context_y, y_pred], dim=0)
+                kl_divergence = torch.distributions.kl_divergence(
+                    posterior_candidate.mvn, posterior_prior.mvn
+                ).sum(dim=-1)
+                kl += kl_divergence
 
-            # Computing posterior variables
-            z_mu_posterior, z_logvar_posterior = self.model.data_to_z_params(combined_x, combined_y)
-            std_prior = self.min_std + self.scaler * torch.sigmoid(z_logvar_context) 
-            std_posterior = self.min_std + self.scaler * torch.sigmoid(z_logvar_posterior)
-
-            p = torch.distributions.Normal(z_mu_posterior, std_posterior)
-            q = torch.distributions.Normal(z_mu_context, std_prior)
-
-            kl_divergence = torch.distributions.kl_divergence(p, q).sum()
-            kl += kl_divergence
-
-        # Average KLD
         return kl / self.num_samples
