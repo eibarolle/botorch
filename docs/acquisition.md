@@ -201,6 +201,7 @@ For every parameter $$\theta$$ remained in the search space, we can predict
 $$\hat{x}_{1:T}$$ with the decoder. We use $$\hat{x}_{1:T}$$ and $$\theta$$ 
 as input to the encoder to re-evaluate the posterior. LIG computes the 
 distributional difference with respect to the latent process.
+
 [Wu2023arxiv]:
    Wu, D., Niu, R., Chinazzi, M., Vespignani, A., Ma, Y.-A., & Yu, R. (2023).
    Deep Bayesian Active Learning for Accelerating Stochastic Simulation.
